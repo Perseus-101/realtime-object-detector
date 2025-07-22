@@ -1,4 +1,4 @@
-# **🚀 Real-Time Object Detection with YOLOv8**
+# **Real-Time Object Detection with YOLOv8**
 
 <p align="center">
 <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT">
