@@ -4,7 +4,13 @@
 <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT">
 <img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python Version">
 <img src="https://img.shields.io/badge/Streamlit-Ready-brightgreen" alt="Streamlit Ready">
-</p>  
+</p>
+
+<p align="center">
+<a href="https://realtime-object-detector.streamlit.app/">
+<img src="https://img.shields.io/badge/View%2520Live%2520App-🚀-brightgreen?style=for-the-badge" alt="View Live App">
+</a>
+</p>
 A web application built with Streamlit that uses a pre-trained YOLOv8 model to perform real-time object detection on video files or a live webcam feed.
 
 ## **✨ Features**

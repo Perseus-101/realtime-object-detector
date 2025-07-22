@@ -2,171 +2,204 @@ import streamlit as st
 import cv2
 import tempfile
 from ultralytics import YOLO
-import time
 import os
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
+import threading
+import time
+import numpy as np
+import av
 
-# Main function to run the Streamlit application for YOLOv8 object detection.
+# --- Model Loading ---
+@st.cache_resource
+def load_yolo_model(model_name):
+    """Loads the YOLOv8 model from cache."""
+    return YOLO(model_name)
+
+# --- Video Processing Class for WebRTC ---
+class YOLOVideoProcessor(VideoProcessorBase):
+    def __init__(self, model, confidence_threshold, save_output):
+        self.model = model
+        self.confidence_threshold = confidence_threshold
+        self.save_output = save_output
+        self.frames = []
+        self.lock = threading.Lock()
+        self.p_time = 0
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        """Processes a single frame and constructs a side-by-side view."""
+        img = frame.to_ndarray(format="bgr24")
+        original_frame = img.copy()
+        
+        # --- FPS Calculation ---
+        c_time = time.time()
+        fps = 1 / (c_time - self.p_time) if (c_time - self.p_time) > 0 else 0
+        self.p_time = c_time
+        
+        # Inference and plotting
+        results = self.model(img, conf=self.confidence_threshold, verbose=False)
+        processed_frame = results[0].plot() # .plot() draws boxes and labels
+        
+        # Draw FPS on the processed frame
+        cv2.putText(processed_frame, f"FPS: {int(fps)}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
+        # If saving is enabled, store only the processed frame
+        if self.save_output:
+            with self.lock:
+                self.frames.append(processed_frame)
+
+        # --- Create the side-by-side layout ---
+        # Ensure frames are the same height
+        h, w, _ = original_frame.shape
+        processed_frame = cv2.resize(processed_frame, (w, h))
+
+        # Combine video frames horizontally
+        combined_frame = np.hstack((original_frame, processed_frame))
+
+        return av.VideoFrame.from_ndarray(combined_frame, format="bgr24")
+
+# --- Main Application ---
 def main():
     st.set_page_config(page_title="Real-Time Object Detection", layout="wide")
     st.title("Real-Time Object Detection")
     st.write("Upload a video file or use your webcam for real-time object detection.")
 
-    # --- Session State Initialization ---
-    if 'run_webcam' not in st.session_state:
-        st.session_state.run_webcam = False
-
-    # --- Sidebar for options ---
     st.sidebar.header("Configuration")
     confidence_threshold = st.sidebar.slider("Confidence Threshold", 0.0, 1.0, 0.5, 0.05)
-    save_output = st.sidebar.checkbox("Save Output Video")
+    save_output = st.sidebar.checkbox("Save Output Video", key="save_output")
     
-    # --- Model Selection ---
-    model_name = "yolov8n.pt" 
     try:
-        @st.cache_resource
-        def load_yolo_model(model_name):
-            return YOLO(model_name)
-        model = load_yolo_model(model_name)
+        model = load_yolo_model("yolov8n.pt")
     except Exception as e:
         st.error(f"Error loading YOLO model: {e}")
-        st.info("Please ensure you have the yolov8n.pt file or an internet connection to download it.")
         return
 
-    st.sidebar.success(f"Successfully loaded YOLO model: {model_name}")
+    st.sidebar.success("YOLOv8 model loaded successfully.")
 
-    # --- Input Source Selection ---
     source_option = st.sidebar.radio("Select Input Source", ["Upload Video File", "Webcam"])
 
-    # --- Video File Upload ---
+    # Use a placeholder to ensure the UI is cleared when switching modes
+    main_placeholder = st.container()
+
     if source_option == "Upload Video File":
-        st.session_state.run_webcam = False
-        
-        uploaded_file = st.file_uploader("Choose a video file", type=["mp4", "avi", "mov", "mkv"])
-        if uploaded_file is not None:
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tfile:
-                tfile.write(uploaded_file.read())
-                video_path = tfile.name
-            
-            if st.button("Start Processing Video"):
-                process_video(video_path, model, confidence_threshold, save_output)
-                os.remove(video_path)
-        else:
-            st.info("Please upload a video file to begin processing.")
-
-    # --- Webcam ---
+        with main_placeholder:
+            process_uploaded_video(model, confidence_threshold, save_output)
     elif source_option == "Webcam":
-        st.sidebar.header("Webcam Control")
-        if st.sidebar.button("Start Webcam"):
-            st.session_state.run_webcam = True
-        
-        if st.sidebar.button("Stop Webcam"):
-            st.session_state.run_webcam = False
-        
-        if st.session_state.run_webcam:
-            st.info("Webcam feed is running...")
-            process_video(0, model, confidence_threshold, save_output)
-        else:
-            st.info("Webcam is stopped. Click 'Start Webcam' in the sidebar to begin.")
+        with main_placeholder:
+            process_webcam(model, confidence_threshold, save_output)
 
-# Processes a video source for object detection and optionally saves the output.
-def process_video(source, model, confidence_threshold, save_output=False):
-    cap = cv2.VideoCapture(source)
-    if not cap.isOpened():
-        st.error("Error: Could not open video source.")
-        return
+def process_uploaded_video(model, confidence_threshold, save_output):
+    """Handles the logic for processing an uploaded video file."""
+    uploaded_file = st.file_uploader("Choose a video...", type=["mp4", "avi", "mov", "mkv"])
+    
+    if uploaded_file is not None:
+        if st.button("Start Processing Video"):
+            process_and_display_video(uploaded_file, model, confidence_threshold, save_output)
 
-    # --- Video Writer Initialization ---
+def process_and_display_video(video_source, model, confidence_threshold, save_output):
+    """Core function to process and display video from a file path."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tfile:
+        tfile.write(video_source.read())
+        video_path = tfile.name
+
+    cap = cv2.VideoCapture(video_path)
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.header("Original Video")
+        original_frame_placeholder = st.empty()
+    with col2:
+        st.header("Detections")
+        processed_frame_placeholder = st.empty()
+    
+    fps_placeholder = st.empty()
+
     video_writer = None
     output_path = ""
     if save_output:
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        # Get FPS from video file, use a default for webcam
         fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
-        
-        # --- Create a temporary file for the output video ---
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tfile:
-            output_path = tfile.name
-        
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as out_tfile:
+            output_path = out_tfile.name
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         video_writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
 
-    # --- UI Placeholders ---
-    col1, col2 = st.columns(2)
-    with col1:
-        st.header("Original")
-        original_frame_placeholder = st.empty()
-    with col2:
-        st.header("Detections")
-        processed_frame_placeholder = st.empty()
-    fps_placeholder = st.empty()
-    
     p_time = 0
-    
     while cap.isOpened():
-        if source == 0 and not st.session_state.get('run_webcam', False):
-            break
-
         success, frame = cap.read()
         if not success:
-            if source != 0:
-                st.write("Video processing finished.")
             break
-
+        
         c_time = time.time()
         fps = 1 / (c_time - p_time) if (c_time - p_time) > 0 else 0
         p_time = c_time
         
-        results = model(frame, stream=True, verbose=False)
-        processed_frame = frame.copy()
+        original_frame_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), use_container_width=True)
+        
+        results = model(frame, conf=confidence_threshold, verbose=False)
+        processed_frame = results[0].plot()
+        
+        cv2.putText(processed_frame, f"FPS: {int(fps)}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        fps_placeholder.text(f"FPS: {int(fps)}")
 
-        for r in results:
-            boxes = r.boxes
-            for box in boxes:
-                conf = box.conf[0]
-                
-                if conf >= confidence_threshold:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    cls_id = int(box.cls[0])
-                    class_name = model.names[cls_id]
-
-                    cv2.rectangle(processed_frame, (x1, y1), (x2, y2), (255, 0, 255), 3)
-                    label = f'{class_name} {conf:.2f}'
-                    label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
-                    label_y = y1 - 10 if y1 - 10 > 10 else y1 + 10
-                    cv2.rectangle(processed_frame, (x1, label_y - label_size[1]), (x1 + label_size[0], label_y + 5), (255, 0, 255), cv2.FILLED)
-                    cv2.putText(processed_frame, label, (x1, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
-
-        # --- Write frame to video file ---
         if video_writer:
             video_writer.write(processed_frame)
-
-        # --- Display Frames and FPS ---
-        original_frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        processed_frame_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
-        original_frame_placeholder.image(original_frame_rgb, channels="RGB", use_container_width=True)
-        processed_frame_placeholder.image(processed_frame_rgb, channels="RGB", use_container_width=True)
-        fps_placeholder.text(f"FPS: {int(fps)}")
+        
+        processed_frame_placeholder.image(cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB), use_container_width=True)
 
     cap.release()
     if video_writer:
         video_writer.release()
-    cv2.destroyAllWindows()
-
-    # --- Provide Download Link ---
+    os.remove(video_path)
+    
+    st.success("Video processing complete.")
     if save_output and os.path.exists(output_path):
-        st.success("Processing complete. You can now download the video.")
         with open(output_path, 'rb') as f:
-            st.download_button(
-                label="Download Processed Video",
-                data=f,
-                file_name="processed_video.mp4",
-                mime="video/mp4"
-            )
-        # Clean up the temporary file after providing the download link
+            st.download_button("Download Processed Video", f, file_name="processed_video.mp4")
         os.remove(output_path)
-    elif not save_output:
-        st.success("Processing complete.")
+
+def process_webcam(model, confidence_threshold, save_output):
+    """Handles the logic for processing the webcam feed with a side-by-side view."""
+    st.header("Webcam Live Feed")
+    st.write("Click 'Start' to begin detection.")
+    
+    # Use columns to create the headers, mimicking the video file layout
+    col1, col2 = st.columns(2)
+    with col1:
+        st.header("Original")
+    with col2:
+        st.header("Detections")
+
+    processor = YOLOVideoProcessor(model, confidence_threshold, save_output)
+    
+    ctx = webrtc_streamer(
+        key="yolo_webcam_combined",
+        mode=WebRtcMode.SENDRECV,
+        video_processor_factory=lambda: processor,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
+
+    if save_output and not ctx.state.playing and len(processor.frames) > 0:
+        st.info("Saving webcam video...")
+        output_path = ""
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as out_tfile:
+            output_path = out_tfile.name
+        
+        frame_height, frame_width, _ = processor.frames[0].shape
+        fps = 20
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video_writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+
+        for frame in processor.frames:
+            video_writer.write(frame)
+        
+        video_writer.release()
+        
+        with open(output_path, 'rb') as f:
+            st.download_button("Download Webcam Video", f, file_name="webcam_video.mp4")
+        os.remove(output_path)
+        processor.frames.clear()
 
 if __name__ == "__main__":
     main()
